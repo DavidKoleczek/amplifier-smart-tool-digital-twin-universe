@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the smart-tools spec for its conformance kit
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/amplifier-smart-tools
+          ref: main
+          path: .smart-tools-spec
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --all-groups
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Tests
+        run: uv run pytest -q
+
+      - name: Smart-tools conformance
+        run: python3 .smart-tools-spec/conformance/run.py . --json-only

@@ -1,0 +1,5 @@
+{
+  "cli_argv": ["uv", "run", "--project", ".", "amplifier-digital-twin-universe"],
+  "deterministic_smoke": ["manifest"],
+  "bad_invocation": ["no-such-capability"]
+}
