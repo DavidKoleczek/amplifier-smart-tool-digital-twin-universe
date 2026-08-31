@@ -38,7 +38,12 @@ jobs:
       # by cli_argv has to resolve on PATH before the runtime rules can run.
       # Without this they SKIP, and a SKIP is not a FAIL -- CI would stay green
       # while testing nothing.
+      #
+      # `uv run --no-project` starts the kit from the dependencies it declares in
+      # its own inline script metadata. Running it under a bare interpreter would
+      # instead borrow whatever happens to be importable from .venv, coupling the
+      # kit's dependency set to this tool's.
       - name: Smart-tools conformance
         run: |
           export PATH="$PWD/.venv/bin:$PATH"
-          python3 "$RUNNER_TEMP/amplifier-smart-tools/conformance/run.py" .
+          uv run --no-project "$RUNNER_TEMP/amplifier-smart-tools/conformance/run.py" .
