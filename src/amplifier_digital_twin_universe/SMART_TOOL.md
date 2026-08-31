@@ -16,7 +16,8 @@ platforms:
   - linux
 requires:
   - name: incus
-    purpose: Runs the isolated environments.
+    purpose: Launches the environments a profile describes. Without it, profiles can still be authored and validated, but not launched.
+    optional: true
     install: docs/installing-incus.md
   - name: git
     purpose: Fetches the agent engine's modules. Profile authoring cannot run without it.
@@ -45,6 +46,8 @@ costs seconds to minutes; a function call costs microseconds.
 ## Sharp edges
 
 - Environments are ephemeral. Anything you want to keep must be pulled out before teardown.
-- `incus` is a hard prerequisite. The tool detects its absence and fails naming the remedy
-  rather than guessing.
+- Authoring and validating a profile needs nothing beyond this tool. Launching what it
+  produces needs `incus` on the host.
 - Without `docker`, profiles that declare sidecars cannot launch. Everything else still works.
+- Drafting a profile is model-backed. With no provider configured it fails saying so, rather
+  than returning a lesser answer.
