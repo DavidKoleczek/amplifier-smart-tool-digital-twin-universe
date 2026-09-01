@@ -7,9 +7,10 @@ import sys
 
 import pytest
 
-from amplifier_digital_twin_universe import MissingPrerequisiteError
-from amplifier_digital_twin_universe.agent import _require_git
+from amplifier_digital_twin_universe import MODEL_BACKED_CAPABILITIES, MissingPrerequisiteError
+from amplifier_digital_twin_universe.catalog import CAPABILITIES
 from amplifier_digital_twin_universe.cli import main
+from amplifier_digital_twin_universe.intelligence.amplifier import _require_git
 from amplifier_digital_twin_universe.manifest import load_manifest, package_version
 
 
@@ -65,7 +66,7 @@ def test_bad_invocation_emits_an_error_envelope_naming_a_remedy(capsys) -> None:
     assert error["remedy"]
 
 
-_CAPABILITIES = ["manifest", "validate-profile", "create-profile"]
+_CAPABILITIES = [capability.name for capability in CAPABILITIES]
 _CLI = [sys.executable, "-m", "amplifier_digital_twin_universe.cli"]
 
 
@@ -85,3 +86,30 @@ def test_capability_full_help_carries_what_a_caller_needs_to_invoke_it(capabilit
     assert not completed.stderr
     for section in ("usage:", "Arguments:", "Returns:", "Exit codes:"):
         assert section in completed.stdout
+
+
+def test_every_capability_names_a_library_function_that_exists() -> None:
+    """A capability the library cannot serve is a capability the CLI invented."""
+    import amplifier_digital_twin_universe as library
+
+    for capability in CAPABILITIES:
+        assert hasattr(library, capability.library), capability.name
+
+
+def test_model_backed_capabilities_disclose_themselves(capsys) -> None:
+    """A caller deciding whether to spend tokens can tell before spending them."""
+    assert MODEL_BACKED_CAPABILITIES
+    for capability in CAPABILITIES:
+        completed = subprocess.run([*_CLI, capability.name, "--help"], capture_output=True, text=True, check=False)
+        expected = "model-backed" if capability.model_backed else "deterministic"
+        assert f"[{expected}]" in completed.stdout, capability.name
+
+
+def test_terse_and_full_help_are_not_the_same_output() -> None:
+    terse = subprocess.run([*_CLI, "-h"], capture_output=True, text=True, check=False)
+    full = subprocess.run([*_CLI, "--help"], capture_output=True, text=True, check=False)
+    assert terse.returncode == full.returncode == 0
+    assert terse.stdout != full.stdout
+    for capability in CAPABILITIES:
+        assert capability.name in terse.stdout
+        assert capability.name in full.stdout

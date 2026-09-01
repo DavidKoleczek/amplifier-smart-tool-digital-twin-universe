@@ -37,13 +37,47 @@ class NoProviderError(SmartToolError):
 
 
 class ProfileInvalidError(SmartToolError):
-    """A profile failed validation."""
+    """A profile failed to parse, so nothing can be launched from it."""
 
     code = "profile_invalid"
 
 
+class ProfileNotFoundError(SmartToolError):
+    """The named profile does not resolve to a file on this host."""
+
+    code = "profile_not_found"
+
+
+class EnvironmentNotFoundError(SmartToolError):
+    """No environment on this host carries the given id."""
+
+    code = "environment_not_found"
+
+
+class EnvironmentLimitError(SmartToolError):
+    """Launching would exceed the concurrent environment ceiling.
+
+    Environments are long-lived and nothing reaps them, so the ceiling is what
+    stands between a fan-out and an exhausted host.
+    """
+
+    code = "environment_limit"
+
+
+class OperationFailedError(SmartToolError):
+    """An environment operation ran and did not succeed."""
+
+    code = "operation_failed"
+
+
+class OperationTimedOutError(SmartToolError):
+    """An environment operation exceeded its time budget."""
+
+    code = "timed_out"
+
+
 class GenerationFailedError(SmartToolError):
-    """The model did not produce a launchable profile within the attempt budget."""
+    """The model did not produce a usable answer within the attempt budget."""
 
     code = "generation_failed"
 

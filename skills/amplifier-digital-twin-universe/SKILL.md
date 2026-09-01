@@ -13,7 +13,7 @@ description: >-
 license: MIT
 metadata:
   author: DavidKoleczek
-  version: "0.1.0"
+  version: "0.2.0"
   repository: https://github.com/DavidKoleczek/amplifier-smart-tool-digital-twin-universe
 ---
 
@@ -41,11 +41,16 @@ it returns, and which capabilities are model-backed. `-h` is a short summary for
 person and is deliberately not the same output. If you cannot confirm something from
 `--help` or the source, say so rather than guessing.
 
-| Need | Source |
-|---|---|
-| What the tool is for and what it needs | <https://github.com/DavidKoleczek/amplifier-smart-tool-digital-twin-universe/blob/main/SMART_TOOL.md> |
-| Installing the required prerequisite | <https://github.com/DavidKoleczek/amplifier-smart-tool-digital-twin-universe/blob/main/docs/installing-incus.md> |
-| Installing the optional prerequisite | <https://github.com/DavidKoleczek/amplifier-smart-tool-digital-twin-universe/blob/main/docs/installing-docker.md> |
+Reference material, when `--help` is not enough:
+
+```
+docs/01-library.md   every capability as Python: signatures, parameters, returns
+docs/03-cli.md       every capability as a command: flags, defaults, exit codes
+docs/02-configuration.md   the environment variables this tool reads
+docs/installing-incus.md   installing the runtime that launches environments
+```
+
+All four live at <https://github.com/DavidKoleczek/amplifier-smart-tool-digital-twin-universe>.
 
 ## Install
 
@@ -63,13 +68,65 @@ uv add "amplifier-digital-twin-universe @ git+https://github.com/DavidKoleczek/a
 
 ## Prerequisites
 
-`incus` is required and runs the environments. Without it nothing can launch, and the
-tool fails naming the remedy rather than guessing.
+Ask the tool rather than assuming. `check` measures this host and reports what is
+present, what is absent, and what each absent thing costs you.
 
-`docker` is optional and runs mock service sidecars. Without it, everything works
-except profiles that declare sidecars.
+```bash
+amplifier-digital-twin-universe check
+```
+
+`incus` runs the environments; without it nothing launches. `docker` runs mock service
+sidecars; without it everything works except profiles that declare sidecars. `git` is
+required by the model-backed capabilities. `avahi` publishes `.local` hostnames.
 
 Linux only. The tool does not claim platforms it has not been run on.
+
+## The shape of the surface
+
+Deterministic, and runnable with no provider configured:
+
+```
+manifest           the manifest as structured data
+check              what this host can do right now
+validate-profile   whether a profile document is launchable
+launch             stand up an environment from a profile path
+exec               run one command inside and capture its output
+status list        what exists, and what state it is in
+check-readiness    evaluate an environment's readiness checks once
+update             re-run an environment's update commands in place
+file-push file-pull   move files in and out
+destroy            tear one down
+```
+
+Model-backed, and failing loudly when no provider is configured:
+
+```
+create-profile     draft a profile from a description of what to test
+install            ordered steps to make this host able to launch
+doctor             diagnose a symptom against measured evidence
+manage             turn a request in words into deterministic actions
+```
+
+## Working with environments
+
+An environment is long-lived and nothing reaps it. Destroy what you launch, and pull
+anything worth keeping out first, because nothing inside survives teardown.
+
+```bash
+amplifier-digital-twin-universe launch --profile ./profile.yaml
+amplifier-digital-twin-universe check-readiness --id dtu-1a2b3c4d
+amplifier-digital-twin-universe exec --id dtu-1a2b3c4d --command "curl -sf localhost:8000/health"
+amplifier-digital-twin-universe file-pull --id dtu-1a2b3c4d --source /var/log/app.log --destination ./
+amplifier-digital-twin-universe destroy --id dtu-1a2b3c4d
+```
+
+`list` is scoped to the machine, not to your session, so an environment another session
+launched appears there too and `destroy` will take it. Name the profile by path;
+profile names that live inside the engine's own repository do not resolve from an
+installed package.
+
+`manage` plans without changing anything and runs only with `--confirmed`, which
+authorizes that one invocation. Read the plan before confirming it.
 
 ## Reading the manifest
 

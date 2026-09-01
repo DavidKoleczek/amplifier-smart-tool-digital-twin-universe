@@ -8,20 +8,19 @@ every attempt.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
-import re
 from typing import Any
 
-from amplifier_digital_twin_universe.agent import TurnResult, preferred_model, run_turn
 from amplifier_digital_twin_universe.errors import GenerationFailedError
-from amplifier_digital_twin_universe.knowledge import authoring_guide
+from amplifier_digital_twin_universe.intelligence import Intelligence, ModelRequest, resolve
+from amplifier_digital_twin_universe.knowledge import authoring_guide, example_profiles
+from amplifier_digital_twin_universe.parsing import extract_yaml
 from amplifier_digital_twin_universe.profiles import ValidationReport, validate_profile
 
 DEFAULT_MAX_ATTEMPTS = 3
 
-_FENCE_RE = re.compile(r"```(?:yaml|yml)?\s*\n(.*?)```", re.DOTALL)
+__all__ = ["DEFAULT_MAX_ATTEMPTS", "ProfileDraft", "create_profile", "extract_yaml"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +33,8 @@ class ProfileDraft:
     attempts: int
     warnings: list[str] = field(default_factory=list)
     unresolved_variables: list[str] = field(default_factory=list)
+    provider: str = ""
+    model: str | None = None
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: Decimal | None = None
@@ -47,6 +48,8 @@ class ProfileDraft:
             "warnings": list(self.warnings),
             "unresolved_variables": list(self.unresolved_variables),
             "usage": {
+                "provider": self.provider,
+                "model": self.model,
                 "tokens_in": self.tokens_in,
                 "tokens_out": self.tokens_out,
                 "cost_usd": None if self.cost_usd is None else str(self.cost_usd),
@@ -54,7 +57,7 @@ class ProfileDraft:
         }
 
 
-async def create_profile_async(
+def create_profile(
     description: str,
     *,
     context: str | None = None,
@@ -62,6 +65,7 @@ async def create_profile_async(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     provider: str | None = None,
     model: str | None = None,
+    intelligence: Intelligence | None = None,
 ) -> ProfileDraft:
     """Draft a launchable DTU profile from a description of what to test.
 
@@ -75,12 +79,15 @@ async def create_profile_async(
     if not description.strip():
         raise ValueError("description must not be empty")
 
+    engine = resolve(intelligence)
+    engine.preflight(provider)
     variables = dict(variables or {})
-    model = model or preferred_model()
 
     history: list[dict[str, Any]] = []
     tokens_in = tokens_out = 0
     cost: Decimal | None = None
+    used_provider = ""
+    used_model: str | None = None
 
     previous_yaml: str | None = None
     previous_report: ValidationReport | None = None
@@ -93,18 +100,17 @@ async def create_profile_async(
             previous_yaml=previous_yaml,
             previous_report=previous_report,
         )
-        turn: TurnResult = await run_turn(prompt, provider=provider, model=model)
+        turn = engine.run(ModelRequest(prompt=prompt, provider=provider, model=model))
 
         tokens_in += turn.tokens_in
         tokens_out += turn.tokens_out
         cost = _add_cost(cost, turn.cost_usd)
+        used_provider = turn.provider
+        used_model = turn.model
 
-        yaml_text = extract_yaml(turn.reply)
+        yaml_text = extract_yaml(turn.text)
         if yaml_text is None:
-            report = ValidationReport(
-                valid=False,
-                errors=["the reply contained no ```yaml fenced block"],
-            )
+            report = ValidationReport(valid=False, errors=["the reply contained no ```yaml fenced block"])
         else:
             report = validate_profile(yaml_text, variables)
 
@@ -127,6 +133,8 @@ async def create_profile_async(
                 attempts=attempt,
                 warnings=list(report.warnings),
                 unresolved_variables=list(report.unresolved_variables),
+                provider=used_provider,
+                model=used_model,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 cost_usd=cost,
@@ -143,45 +151,6 @@ async def create_profile_async(
     )
 
 
-def create_profile(
-    description: str,
-    *,
-    context: str | None = None,
-    variables: dict[str, str] | None = None,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    provider: str | None = None,
-    model: str | None = None,
-) -> ProfileDraft:
-    """Synchronous form of `create_profile_async`.
-
-    Model-backed. Call the async form from inside a running event loop.
-    """
-    return asyncio.run(
-        create_profile_async(
-            description,
-            context=context,
-            variables=variables,
-            max_attempts=max_attempts,
-            provider=provider,
-            model=model,
-        )
-    )
-
-
-def extract_yaml(reply: str) -> str | None:
-    """Pull the YAML document out of a model reply.
-
-    Deterministic. Returns None when the reply carries no fenced block, which the
-    caller treats as a failed attempt rather than guessing at the prose.
-    """
-    matches = _FENCE_RE.findall(reply)
-    if not matches:
-        return None
-    # The document is the last fenced block: a model that narrates before
-    # answering puts its examples first and its answer last.
-    return matches[-1].strip() + "\n"
-
-
 def _build_prompt(
     *,
     description: str,
@@ -192,8 +161,19 @@ def _build_prompt(
 ) -> str:
     parts = [
         authoring_guide(),
+        "",
+        "# Worked examples",
+        "Profiles that launch today. Follow their shape.",
+    ]
+
+    for name, text in example_profiles().items():
+        parts += ["", f"## {name}", "```yaml", text.strip(), "```"]
+
+    parts += [
+        "",
         "# Task",
         "Write one Digital Twin Universe profile for the following request.",
+        "Reply with the profile in a single ```yaml fenced block and nothing after it.",
         "",
         "## Request",
         description.strip(),

@@ -1,31 +1,56 @@
 """Thin CLI over the library.
 
 Argument parsing, I/O conventions, and structured output live here. Domain logic
-does not: anything the CLI can do, the library can do. Results go to stdout as
-JSON; failures go to stdout as a JSON error envelope with a non-zero exit code.
+does not: anything the CLI can do, the library can do, and every handler below is
+one library call plus the shaping of its result. Results go to stdout as JSON;
+failures go to stdout as a JSON error envelope with a non-zero exit code.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 from pathlib import Path
+import shlex
 import sys
-import textwrap
-from typing import Any, NamedTuple, NoReturn
+from typing import Any, NoReturn
 
-from amplifier_digital_twin_universe import MODEL_BACKED_CAPABILITIES
+from amplifier_digital_twin_universe.catalog import (
+    BY_NAME,
+    PROG,
+    TERSE,
+    Capability,
+    capability_help,
+    full_help,
+    terse_help,
+)
 from amplifier_digital_twin_universe.create import DEFAULT_MAX_ATTEMPTS, create_profile
+from amplifier_digital_twin_universe.doctor import diagnose
+from amplifier_digital_twin_universe.environments import (
+    DEFAULT_EXEC_TIMEOUT_SECONDS,
+    DEFAULT_FILE_TIMEOUT_SECONDS,
+    check_readiness,
+    destroy,
+    launch,
+    list_environments,
+    pull_files,
+    push_files,
+    run,
+    status,
+    update,
+)
 from amplifier_digital_twin_universe.errors import (
     GenerationFailedError,
     MissingPrerequisiteError,
     NoProviderError,
     SmartToolError,
 )
+from amplifier_digital_twin_universe.install import plan_install
+from amplifier_digital_twin_universe.manager import manage
 from amplifier_digital_twin_universe.manifest import ManifestError, load_manifest
+from amplifier_digital_twin_universe.prerequisites import probe
 from amplifier_digital_twin_universe.profiles import validate_profile
-
-PROG = "amplifier-digital-twin-universe"
 
 EXIT_OK = 0
 EXIT_BAD_INVOCATION = 2
@@ -39,7 +64,10 @@ _EXIT_FOR_ERROR = {
 }
 
 
-def _emit(document: dict[str, Any]) -> None:
+# ----------------------------------------------------------------- output
+
+
+def _emit(document: Any) -> None:
     """Write exactly one JSON document to stdout, newline-terminated."""
     json.dump(document, sys.stdout, sort_keys=True, default=str)
     sys.stdout.write("\n")
@@ -48,6 +76,25 @@ def _emit(document: dict[str, Any]) -> None:
 def _emit_error(code: str, message: str, remedy: str, exit_code: int, **extra: Any) -> int:
     _emit({"error": {"code": code, "message": message, "remedy": remedy, **extra}})
     return exit_code
+
+
+def _attempt(operation: Callable[[], Any], *, failed: Callable[[Any], bool] | None = None) -> int:
+    """Run one library call and shape whatever comes back into the output contract."""
+    try:
+        result = operation()
+    except GenerationFailedError as exc:
+        return _emit_error(exc.code, exc.message, exc.remedy, EXIT_FAILED, attempts=exc.attempts)
+    except SmartToolError as exc:
+        return _emit_error(exc.code, exc.message, exc.remedy, _EXIT_FOR_ERROR.get(type(exc), EXIT_FAILED))
+    except ValueError as exc:
+        return _emit_error(
+            "bad_invocation",
+            str(exc),
+            f"Run '{PROG} --help' for the arguments each capability takes.",
+            EXIT_BAD_INVOCATION,
+        )
+    _emit({"result": result})
+    return EXIT_FAILED if failed is not None and failed(result) else EXIT_OK
 
 
 class _EnvelopeParser(argparse.ArgumentParser):
@@ -69,8 +116,10 @@ class _EnvelopeParser(argparse.ArgumentParser):
         raise SystemExit(EXIT_BAD_INVOCATION)
 
 
+# ------------------------------------------------------------- deterministic
+
+
 def cmd_manifest(_args: argparse.Namespace) -> int:
-    """[deterministic] Emit this tool's manifest as structured data."""
     try:
         manifest = load_manifest()
     except ManifestError as exc:
@@ -84,8 +133,11 @@ def cmd_manifest(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_check(_args: argparse.Namespace) -> int:
+    return _attempt(lambda: probe().to_dict())
+
+
 def cmd_validate_profile(args: argparse.Namespace) -> int:
-    """[deterministic] Check whether a profile document is launchable."""
     try:
         yaml_text = _read_source(args.file)
     except OSError as exc:
@@ -102,21 +154,96 @@ def cmd_validate_profile(args: argparse.Namespace) -> int:
     return EXIT_OK if report.valid else EXIT_FAILED
 
 
+def cmd_launch(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: launch(
+            args.profile,
+            variables=_parse_vars(args.var),
+            name=args.name,
+            hostname=args.hostname,
+            max_environments=args.max_environments,
+        )
+    )
+
+
+def cmd_exec(args: argparse.Namespace) -> int:
+    command = shlex.split(args.command)
+    if not command:
+        return _emit_error(
+            "bad_invocation",
+            "--command is empty.",
+            "Pass one shell command line, such as --command 'uname -a'.",
+            EXIT_BAD_INVOCATION,
+        )
+    return _attempt(lambda: run(args.id, command, timeout=args.timeout))
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    return _attempt(lambda: status(args.id))
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    return _attempt(list_environments)
+
+
+def cmd_check_readiness(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: check_readiness(args.id, skip_access_check=args.skip_access_check),
+        failed=lambda result: result.get("ready") is False,
+    )
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: update(
+            args.id,
+            variables=_parse_vars(args.var),
+            skip_readiness=args.skip_readiness,
+        )
+    )
+
+
+def cmd_file_push(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: push_files(
+            args.id,
+            args.source,
+            args.destination,
+            recursive=args.recursive,
+            mode=args.mode,
+            uid=args.uid,
+            gid=args.gid,
+            timeout=args.timeout,
+        )
+    )
+
+
+def cmd_file_pull(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: pull_files(
+            args.id,
+            args.source,
+            args.destination,
+            recursive=args.recursive,
+            timeout=args.timeout,
+        )
+    )
+
+
+def cmd_destroy(args: argparse.Namespace) -> int:
+    return _attempt(lambda: destroy(args.id))
+
+
+# -------------------------------------------------------------- model-backed
+
+
 def cmd_create_profile(args: argparse.Namespace) -> int:
-    """[model-backed] Draft a launchable profile from a description."""
-    context = None
-    if args.context_file:
-        try:
-            context = _read_source(args.context_file)
-        except OSError as exc:
-            return _emit_error(
-                "unreadable_input",
-                str(exc),
-                "Pass a readable path to --context-file.",
-                EXIT_BAD_INVOCATION,
-            )
-    try:
-        draft = create_profile(
+    context, failure = _read_context(args.context_file)
+    if failure is not None:
+        return failure
+
+    def draft() -> dict[str, Any]:
+        result = create_profile(
             args.description,
             context=context,
             variables=_parse_vars(args.var),
@@ -124,27 +251,89 @@ def cmd_create_profile(args: argparse.Namespace) -> int:
             provider=args.provider,
             model=args.model,
         )
-    except GenerationFailedError as exc:
-        return _emit_error(exc.code, exc.message, exc.remedy, EXIT_FAILED, attempts=exc.attempts)
-    except SmartToolError as exc:
-        return _emit_error(exc.code, exc.message, exc.remedy, _EXIT_FOR_ERROR.get(type(exc), EXIT_FAILED))
+        document = result.to_dict()
+        if args.out:
+            # A capability that produces an artifact identifies it rather than
+            # embedding it in a message.
+            document["path"] = _write_artifact(args.out, result.yaml_text)
+        return document
 
-    result = draft.to_dict()
-    if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(draft.yaml_text, encoding="utf-8")
-        # A capability that produces an artifact identifies it rather than
-        # embedding it in a message.
-        result["path"] = str(out)
-    _emit({"result": result})
-    return EXIT_OK
+    return _attempt(draft)
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    context, failure = _read_context(args.context_file)
+    if failure is not None:
+        return failure
+    return _attempt(
+        lambda: plan_install(
+            goal=args.goal,
+            context=context,
+            max_attempts=args.max_attempts,
+            provider=args.provider,
+            model=args.model,
+        ).to_dict()
+    )
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    context, failure = _read_context(args.context_file)
+    if failure is not None:
+        return failure
+    return _attempt(
+        lambda: diagnose(
+            args.symptom,
+            environment_id=args.id,
+            context=context,
+            max_attempts=args.max_attempts,
+            provider=args.provider,
+            model=args.model,
+        ).to_dict()
+    )
+
+
+def cmd_manage(args: argparse.Namespace) -> int:
+    return _attempt(
+        lambda: manage(
+            args.request,
+            confirmed=args.confirmed,
+            max_attempts=args.max_attempts,
+            provider=args.provider,
+            model=args.model,
+        ).to_dict(),
+        failed=lambda result: not result.get("complete", True),
+    )
+
+
+# ------------------------------------------------------------------- inputs
 
 
 def _read_source(source: str) -> str:
     if source == "-":
         return sys.stdin.read()
     return Path(source).read_text(encoding="utf-8")
+
+
+def _read_context(path: str | None) -> tuple[str | None, int | None]:
+    """The context payload, or the exit code that says why it could not be read."""
+    if not path:
+        return None, None
+    try:
+        return _read_source(path), None
+    except OSError as exc:
+        return None, _emit_error(
+            "unreadable_input",
+            str(exc),
+            "Pass a readable path to --context-file.",
+            EXIT_BAD_INVOCATION,
+        )
+
+
+def _write_artifact(path: str, content: str) -> str:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(content, encoding="utf-8")
+    return str(out)
 
 
 def _parse_vars(pairs: list[str] | None) -> dict[str, str]:
@@ -164,219 +353,18 @@ def _parse_vars(pairs: list[str] | None) -> dict[str, str]:
     return out
 
 
-_TERSE = "Stand up isolated, realistic environments from a declarative profile."
-
-_MODEL_BACKED_LINE = (
-    "Model-backed capabilities: "
-    + ", ".join(MODEL_BACKED_CAPABILITIES)
-    + ". These consume tokens and\nmay return a different answer on a second run. They fail rather than degrade\n"
-    "when no provider is configured. Every other capability is deterministic and\n"
-    "runs with no model provider configured.\n"
-    if MODEL_BACKED_CAPABILITIES
-    else "No capability is model-backed. Every capability listed above is deterministic\n"
-    "and runs with no model provider configured.\n"
-)
-
-_OUTPUT_NOTE = (
-    'Output: one JSON document on stdout. Failures emit\n{"error": {"code", "message", "remedy"}} and exit non-zero.\n'
-)
-
-_MODEL_BACKED_NOTE = (
-    "This capability is model-backed: it consumes tokens and may return a different\n"
-    "answer on a second run. It fails rather than degrades when no model provider is\n"
-    "configured.\n"
-)
-
-_DETERMINISTIC_NOTE = (
-    "This capability is deterministic: it returns the same answer every time and\n"
-    "runs with no model provider configured.\n"
-)
-
-_HELP_WIDTH = 78
-
-# Column layout for the compact per-capability blocks in the top-level listing.
-_NAME_COLUMN = 18
-_KIND_COLUMN = 17
-_FIELD_INDENT = " " * (2 + _NAME_COLUMN)
+def _parse_timeout(value: str) -> int | None:
+    """Seconds, or None when the caller asked for no timeout at all."""
+    normalized = value.strip().lower()
+    if normalized in ("none", "null"):
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer number of seconds or 'none', got {value!r}") from None
 
 
-class _Capability(NamedTuple):
-    """What a caller needs to know to invoke one capability.
-
-    One record feeds both readers: the top-level `--help` listing renders it
-    compactly alongside its siblings, and the capability's own `--help` renders
-    it in full. Neither restates the other's text.
-    """
-
-    name: str
-    summary: str
-    args: tuple[str, ...]
-    returns: str
-    exits: tuple[str, ...]
-    notes: tuple[str, ...] = ()
-
-    @property
-    def model_backed(self) -> bool:
-        # The declaration is made against the library's names, so the CLI asks
-        # in those terms rather than keeping a second list of its own.
-        return self.name.replace("-", "_") in MODEL_BACKED_CAPABILITIES
-
-    @property
-    def kind(self) -> str:
-        return "model-backed" if self.model_backed else "deterministic"
-
-    @property
-    def usage_parts(self) -> list[str]:
-        """The usage line as tokens, so wrapping never splits one apart."""
-        parts = [f"{PROG} {self.name}"]
-        for arg in self.args:
-            spec, _, qualifier = arg.partition(" (")
-            qualifier = qualifier.rstrip(")")
-            if qualifier == "required":
-                parts.append(spec)
-            elif qualifier == "repeatable":
-                parts.append(f"[{spec} ...]")
-            else:
-                parts.append(f"[{spec}]")
-        return parts
-
-
-_CAPABILITIES = (
-    _Capability(
-        name="manifest",
-        summary="Emit this tool's manifest as structured data.",
-        args=(),
-        returns=('{"result": {smart_tool_format, name, version, description, use_cases[], platforms[], requires[]}}'),
-        exits=(
-            "0 the manifest was emitted",
-            "2 the invocation was bad",
-            "5 the manifest could not be read",
-        ),
-    ),
-    _Capability(
-        name="validate-profile",
-        summary="Check whether a profile document is launchable.",
-        args=("--file PATH|- (required)", "--var KEY=VALUE (repeatable)"),
-        returns=('{"result": {valid: bool, name, description, errors[], warnings[], unresolved_variables[]}}'),
-        exits=(
-            "0 the profile is launchable",
-            "2 the invocation was bad or the profile could not be read",
-            "5 the profile is not launchable",
-        ),
-    ),
-    _Capability(
-        name="create-profile",
-        summary="Draft a launchable profile from a description.",
-        args=(
-            "--description TEXT (required)",
-            "--context-file PATH",
-            "--var KEY=VALUE (repeatable)",
-            "--out PATH",
-            f"--max-attempts N (default {DEFAULT_MAX_ATTEMPTS})",
-            "--provider NAME",
-            "--model NAME",
-        ),
-        returns=('{"result": {yaml, name, description, attempts, warnings[], unresolved_variables[], usage{}, path?}}'),
-        exits=(
-            "0 a profile was drafted",
-            "2 the invocation was bad or the context file could not be read",
-            "3 no model provider is configured",
-            "4 a prerequisite is missing",
-            "5 the draft budget was spent without a clean parse",
-        ),
-        notes=(
-            (
-                "Each draft is validated by the engine's own profile loader and repaired "
-                "until it parses cleanly or the budget is spent."
-            ),
-        ),
-    ),
-)
-
-_BY_NAME = {capability.name: capability for capability in _CAPABILITIES}
-
-
-def _wrap(text: str, indent: str = "", continuation: str | None = None) -> list[str]:
-    return textwrap.wrap(
-        text,
-        width=_HELP_WIDTH,
-        initial_indent=indent,
-        subsequent_indent=indent if continuation is None else continuation,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-
-
-def _pack(tokens: list[str], indent: str, continuation: str) -> list[str]:
-    """Fill lines with whole tokens. Tokens carry spaces, so wrapping cannot split one."""
-    lines: list[str] = []
-    current = indent
-    for token in tokens:
-        if current in (indent, continuation):
-            current += token
-        elif len(current) + 1 + len(token) <= _HELP_WIDTH:
-            current += f" {token}"
-        else:
-            lines.append(current)
-            current = continuation + token
-    lines.append(current)
-    return lines
-
-
-def _tokens(items: tuple[str, ...], separator: str) -> list[str]:
-    """Items as wrap tokens, each carrying the separator that follows it."""
-    return [f"{item}{separator}" for item in items[:-1]] + list(items[-1:])
-
-
-def _field(label: str, tokens: list[str]) -> list[str]:
-    """A labelled field in the top-level listing, wrapped under its own label."""
-    first, *rest = tokens
-    return _pack([f"{label}: {first}", *rest], _FIELD_INDENT, _FIELD_INDENT + " " * (len(label) + 2))
-
-
-def _compact_block(capability: _Capability) -> str:
-    """One capability as it appears in the top-level `--help` listing."""
-    kind = f"[{capability.kind}]"
-    lines = [f"  {capability.name:<{_NAME_COLUMN}}{kind:<{_KIND_COLUMN}}{capability.summary}"]
-    lines += _field("args", _tokens(capability.args, ",") or ["none"])
-    lines += _field("returns", capability.returns.split(" "))
-    lines += _field("exit", _tokens(capability.exits, ";"))
-    for note in capability.notes:
-        lines += _wrap(note, _FIELD_INDENT)
-    return "\n".join(lines) + "\n"
-
-
-def _capability_help(capability: _Capability) -> str:
-    """One capability in full, for an agent deciding how to call it."""
-    lines = [f"{PROG} {capability.name} -- [{capability.kind}] {capability.summary}", ""]
-    lines += _pack(capability.usage_parts, "usage: ", " " * 7)
-    lines += ["", "Arguments:"]
-    lines += [f"  {arg}" for arg in capability.args] or ["  none"]
-    lines += ["", "Returns:"]
-    lines += _wrap(capability.returns, "  ", "    ")
-    lines += ["", "Exit codes:"]
-    lines += [f"  {code}" for code in capability.exits]
-    for note in capability.notes:
-        lines += ["", *_wrap(note)]
-    disclosure = _MODEL_BACKED_NOTE if capability.model_backed else _DETERMINISTIC_NOTE
-    lines += ["", *disclosure.rstrip("\n").split("\n")]
-    lines += ["", *_OUTPUT_NOTE.rstrip("\n").split("\n")]
-    return "\n".join(lines) + "\n"
-
-
-# `--help` is the complete, agent-facing listing. `-h` is the terse user summary.
-# They are not aliases, at either level.
-_FULL_HELP = (
-    "Capabilities:\n"
-    + "\n".join(_compact_block(capability) for capability in _CAPABILITIES)
-    + "\n"
-    + _MODEL_BACKED_LINE
-    + "\n"
-    + _OUTPUT_NOTE
-    + "\n"
-    + "Exit codes: 0 success, 2 bad invocation, 3 no model provider configured,\n"
-    + "4 missing prerequisite, 5 the capability ran and failed.\n"
-)
+# -------------------------------------------------------------------- help
 
 
 class _TerseHelpAction(argparse.Action):
@@ -386,28 +374,28 @@ class _TerseHelpAction(argparse.Action):
         super().__init__(option_strings, dest, nargs=0, **kwargs)
 
     def __call__(self, parser: argparse.ArgumentParser, *_rest: Any) -> NoReturn:
-        capabilities = "".join(f"  {capability.name:<19}{capability.summary}\n" for capability in _CAPABILITIES)
-        sys.stdout.write(
-            f"{PROG} -- {_TERSE}\n\nCapabilities:\n{capabilities}\nRun '{PROG} --help' for the complete listing.\n"
-        )
+        sys.stdout.write(terse_help())
         raise SystemExit(EXIT_OK)
 
 
 class _CapabilityHelpAction(argparse.Action):
     """`--help` on a capability: everything needed to call that capability."""
 
-    def __init__(self, option_strings: list[str], dest: str, capability: _Capability, **kwargs: Any) -> None:
+    def __init__(self, option_strings: list[str], dest: str, capability: Capability, **kwargs: Any) -> None:
         super().__init__(option_strings, dest, nargs=0, **kwargs)
         self.capability = capability
 
     def __call__(self, parser: argparse.ArgumentParser, *_rest: Any) -> NoReturn:
-        sys.stdout.write(_capability_help(self.capability))
+        sys.stdout.write(capability_help(self.capability))
         raise SystemExit(EXIT_OK)
 
 
-def _add_capability_parser(sub: argparse._SubParsersAction, name: str) -> argparse.ArgumentParser:
+# ------------------------------------------------------------------ parser
+
+
+def _add(sub: argparse._SubParsersAction, name: str, handler: Callable[..., int]) -> argparse.ArgumentParser:
     """Register one capability with the same two-level help the top level has."""
-    capability = _BY_NAME[name]
+    capability = BY_NAME[name]
     label = f"[{capability.kind}] {capability.summary}"
     parser = sub.add_parser(name, help=label, description=label, add_help=False)
     parser.add_argument("-h", action="help", help="Terse summary for a person.")
@@ -417,14 +405,35 @@ def _add_capability_parser(sub: argparse._SubParsersAction, name: str) -> argpar
         capability=capability,
         help="Everything an agent needs to call this capability.",
     )
+    parser.set_defaults(func=handler)
     return parser
+
+
+def _add_environment_id(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--id", metavar="ID", required=True, help="The environment id, as reported by `list`.")
+
+
+def _add_vars(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--var", action="append", metavar="KEY=VALUE", help="Launch variable. Repeatable.")
+
+
+def _add_model_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--max-attempts",
+        metavar="N",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=f"Draft-and-repair budget (default {DEFAULT_MAX_ATTEMPTS}).",
+    )
+    parser.add_argument("--provider", metavar="NAME", help="Model provider to use.")
+    parser.add_argument("--model", metavar="NAME", help="Model to use.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _EnvelopeParser(
         prog=PROG,
-        description=_TERSE,
-        epilog=_FULL_HELP,
+        description=TERSE,
+        epilog=full_help(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
     )
@@ -437,33 +446,116 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="capability")
 
-    p_manifest = _add_capability_parser(sub, "manifest")
-    p_manifest.set_defaults(func=cmd_manifest)
+    _add(sub, "manifest", cmd_manifest)
+    _add(sub, "check", cmd_check)
 
-    p_validate = _add_capability_parser(sub, "validate-profile")
+    p_validate = _add(sub, "validate-profile", cmd_validate_profile)
     p_validate.add_argument(
         "--file", metavar="PATH|-", required=True, help="Path to the profile YAML, or '-' for stdin."
     )
-    p_validate.add_argument("--var", action="append", metavar="KEY=VALUE", help="Launch variable. Repeatable.")
-    p_validate.set_defaults(func=cmd_validate_profile)
+    _add_vars(p_validate)
 
-    p_create = _add_capability_parser(sub, "create-profile")
-    p_create.add_argument("--description", metavar="TEXT", required=True, help="What you want to stand up and test.")
-    p_create.add_argument(
-        "--context-file", metavar="PATH", help="Path to extra material for the model, read into the payload."
-    )
-    p_create.add_argument("--var", action="append", metavar="KEY=VALUE", help="Launch variable. Repeatable.")
-    p_create.add_argument("--out", metavar="PATH", help="Write the profile YAML here and report the path.")
-    p_create.add_argument(
-        "--max-attempts",
+    p_launch = _add(sub, "launch", cmd_launch)
+    p_launch.add_argument("--profile", metavar="PATH", required=True, help="Path to the profile YAML to launch.")
+    _add_vars(p_launch)
+    p_launch.add_argument("--name", metavar="NAME", help="Name the environment instead of generating one.")
+    p_launch.add_argument("--hostname", metavar="NAME", help="Register NAME.local for the environment over mDNS.")
+    p_launch.add_argument(
+        "--max-environments",
         metavar="N",
         type=int,
-        default=DEFAULT_MAX_ATTEMPTS,
-        help=f"Draft-and-repair budget (default {DEFAULT_MAX_ATTEMPTS}).",
+        help="Refuse to launch beyond N concurrent environments. 0 removes the ceiling.",
     )
-    p_create.add_argument("--provider", metavar="NAME", help="Model provider to use.")
-    p_create.add_argument("--model", metavar="NAME", help="Model to use.")
-    p_create.set_defaults(func=cmd_create_profile)
+
+    p_exec = _add(sub, "exec", cmd_exec)
+    _add_environment_id(p_exec)
+    p_exec.add_argument("--command", metavar="TEXT", required=True, help="One shell command line to run inside.")
+    p_exec.add_argument(
+        "--timeout",
+        metavar="SECS|none",
+        type=_parse_timeout,
+        default=DEFAULT_EXEC_TIMEOUT_SECONDS,
+        help=f"Seconds to allow, or 'none' (default {DEFAULT_EXEC_TIMEOUT_SECONDS}).",
+    )
+
+    p_status = _add(sub, "status", cmd_status)
+    _add_environment_id(p_status)
+
+    _add(sub, "list", cmd_list)
+
+    p_readiness = _add(sub, "check-readiness", cmd_check_readiness)
+    _add_environment_id(p_readiness)
+    p_readiness.add_argument(
+        "--skip-access-check",
+        action="store_true",
+        help="Evaluate only the in-environment checks, not host-side port reachability.",
+    )
+
+    p_update = _add(sub, "update", cmd_update)
+    _add_environment_id(p_update)
+    _add_vars(p_update)
+    p_update.add_argument("--skip-readiness", action="store_true", help="Do not re-run readiness checks afterwards.")
+
+    p_push = _add(sub, "file-push", cmd_file_push)
+    _add_environment_id(p_push)
+    p_push.add_argument("--source", action="append", required=True, metavar="PATH", help="Host path. Repeatable.")
+    p_push.add_argument("--destination", metavar="PATH", required=True, help="Path inside the environment.")
+    p_push.add_argument("--recursive", action="store_true", help="Copy directories and their contents.")
+    p_push.add_argument("--mode", metavar="MODE", help="Permission bits to set, such as 0644.")
+    p_push.add_argument("--uid", metavar="UID", type=int, help="Owner to set inside the environment.")
+    p_push.add_argument("--gid", metavar="GID", type=int, help="Group to set inside the environment.")
+    p_push.add_argument(
+        "--timeout",
+        metavar="SECS",
+        type=int,
+        default=DEFAULT_FILE_TIMEOUT_SECONDS,
+        help=f"Seconds to allow per transfer (default {DEFAULT_FILE_TIMEOUT_SECONDS}).",
+    )
+
+    p_pull = _add(sub, "file-pull", cmd_file_pull)
+    _add_environment_id(p_pull)
+    p_pull.add_argument("--source", action="append", required=True, metavar="PATH", help="Path inside. Repeatable.")
+    p_pull.add_argument("--destination", metavar="PATH", required=True, help="Host path to write to.")
+    p_pull.add_argument("--recursive", action="store_true", help="Copy directories and their contents.")
+    p_pull.add_argument(
+        "--timeout",
+        metavar="SECS",
+        type=int,
+        default=DEFAULT_FILE_TIMEOUT_SECONDS,
+        help=f"Seconds to allow per transfer (default {DEFAULT_FILE_TIMEOUT_SECONDS}).",
+    )
+
+    p_destroy = _add(sub, "destroy", cmd_destroy)
+    _add_environment_id(p_destroy)
+
+    p_create = _add(sub, "create-profile", cmd_create_profile)
+    p_create.add_argument("--description", metavar="TEXT", required=True, help="What you want to stand up and test.")
+    p_create.add_argument("--context-file", metavar="PATH", help="Extra material for the model, read into the payload.")
+    _add_vars(p_create)
+    p_create.add_argument("--out", metavar="PATH", help="Write the profile YAML here and report the path.")
+    _add_model_options(p_create)
+
+    p_install = _add(sub, "install", cmd_install)
+    p_install.add_argument("--goal", metavar="TEXT", help="What you want to use the environments for.")
+    p_install.add_argument(
+        "--context-file", metavar="PATH", help="Extra material for the model, read into the payload."
+    )
+    _add_model_options(p_install)
+
+    p_doctor = _add(sub, "doctor", cmd_doctor)
+    p_doctor.add_argument("--symptom", metavar="TEXT", help="What you observed, in your own words.")
+    p_doctor.add_argument("--id", metavar="ID", help="Measure this environment as well as the host.")
+    p_doctor.add_argument("--context-file", metavar="PATH", help="Extra material for the model, read into the payload.")
+    _add_model_options(p_doctor)
+
+    p_manage = _add(sub, "manage", cmd_manage)
+    p_manage.add_argument("--request", metavar="TEXT", required=True, help="What you want done, in your own words.")
+    p_manage.add_argument(
+        "--confirmed",
+        action="store_true",
+        help="Run the planned steps. Authorizes this invocation only.",
+    )
+    _add_model_options(p_manage)
 
     return parser
 
@@ -478,7 +570,21 @@ def main(argv: list[str] | None = None) -> int:
             f"Run '{PROG} --help' to see the available capabilities.",
             EXIT_BAD_INVOCATION,
         )
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        # A failure nothing anticipated is still a failure a caller has to see as
+        # data. The traceback goes to stderr for a person; the envelope goes to
+        # stdout for whatever is parsing it.
+        import traceback
+
+        traceback.print_exc()
+        return _emit_error(
+            "unexpected",
+            f"{type(exc).__name__}: {exc}",
+            "This is a defect in the tool. Report it with the traceback on stderr.",
+            EXIT_FAILED,
+        )
 
 
 if __name__ == "__main__":
